@@ -105,7 +105,7 @@ class TfmType(IntEnum):
     PIXEL = 2
     COORD = 3
     CLASS = 4
-
+    MASK = 5
 
 class Denormalize():
     """ De-normalizes an image, returning it to original format.
@@ -115,6 +115,9 @@ class Denormalize():
         self.s=np.array(s, dtype=np.float32)
     def __call__(self, x): return x*self.s+self.m
 
+    def determ(self): return self.new_transform
+
+    def new_transform(self, x, tfmtype, is_y=False): return x * self.s + self.m
 
 class Normalize():
     """ Normalizes an image.  """
@@ -123,6 +126,13 @@ class Normalize():
         self.s=np.array(s, dtype=np.float32)
         self.tfm_y=tfm_y
 
+    def determ(self): return self.new_transform
+
+    def new_transform(self, x, tfmtype, is_y=False):
+        if tfmtype == TfmType.PIXEL:
+            x = (x - self.m) / self.s
+        return x
+
     def __call__(self, x, y=None):
         x = (x-self.m)/self.s
         if self.tfm_y==TfmType.PIXEL and y is not None: y = (y-self.m)/self.s
@@ -130,6 +140,17 @@ class Normalize():
 
 class ChannelOrder():
     def __init__(self, tfm_y=TfmType.NO): self.tfm_y=tfm_y
+
+    def determ(self): return self.new_transform
+
+    def new_transform(self, x, tfmtype, is_y=False):
+        if tfmtype == TfmType.PIXEL:
+            x = np.rollaxis(x, 2)
+        if tfmtype == TfmType.CLASS:
+            x = x[..., 0]
+        if tfmtype == TfmType.MASK:
+            x = x.squeeze()[None, ...]
+        return x
 
     def __call__(self, x, y):
         x = np.rollaxis(x, 2)
@@ -184,14 +205,32 @@ class Transform():
     def __init__(self, tfm_y=TfmType.NO):
         self.tfm_y=tfm_y
         self.store = threading.local()
+        self.store.shape = None
+
+    def determ(self):
+        self.set_state()
+        self.store.shape = None
+        return self.new_transform
+
+    def new_transform(self, x, tfmtype, is_y=False):
+        if not is_y:
+            self.store.shape = x.shape # used in subsequent transform_coord
+        if tfmtype == TfmType.COORD:
+            return self.new_transform_coord(x)
+        if tfmtype == TfmType.NO:
+            return x
+        return self.do_transform(x, is_y)
 
     def set_state(self): pass
+
     def __call__(self, x, y):
         self.set_state()
         x,y = ((self.transform(x),y) if self.tfm_y==TfmType.NO
                 else self.transform(x,y) if self.tfm_y in (TfmType.PIXEL, TfmType.CLASS)
                 else self.transform_coord(x,y))
         return x, y
+
+    def new_transform_coord(self, y): return y
 
     def transform_coord(self, x, y): return self.transform(x),y
 
@@ -207,17 +246,24 @@ class CoordTransform(Transform):
     """ A coordinate transform.  """
 
     @staticmethod
-    def make_square(y, x):
-        r,c,*_ = x.shape
+    def make_square(y, x_shape):
+        r,c,*_ = x_shape
         y1 = np.zeros((r, c))
         y = y.astype(np.int)
         y1[y[0]:y[2], y[1]:y[3]] = 1.
         return y1
 
-    def map_y(self, y0, x):
-        y = CoordTransform.make_square(y0, x)
+    def map_y(self, y0, x_shape):
+        y = CoordTransform.make_square(y0, x_shape)
         y_tr = self.do_transform(y, True)
         return to_bb(y_tr, y)
+
+    def new_transform_coord(self, y):
+        if self.store.shape is None:
+            raise ValueError("You cannot run TfmType.COORD transformation without running first transformation of x (is_y=False)")
+        yp = partition(y, 4)
+        y2 = [self.map_y(y, self.store.shape) for y in yp]
+        return np.concatenate(y2)
 
     def transform_coord(self, x, ys):
         yp = partition(ys, 4)
@@ -537,17 +583,35 @@ class CropType(IntEnum):
 crop_fn_lu = {CropType.RANDOM: RandomCrop, CropType.CENTER: CenterCrop, CropType.NO: NoCrop}
 
 class Transforms():
-    def __init__(self, sz, tfms, normalizer, denorm, crop_type=CropType.CENTER, tfm_y=TfmType.NO, sz_y=None):
+    def __init__(self, sz, tfms, normalizer, denorm, crop_type=CropType.CENTER, tfm_y=TfmType.NO, sz_y=None, apply_transform=None):
         if sz_y is None: sz_y = sz
         self.sz,self.denorm,self.norm,self.sz_y = sz,denorm,normalizer,sz_y
         crop_tfm = crop_fn_lu[crop_type](sz, tfm_y, sz_y)
         self.tfms = tfms + [crop_tfm, normalizer, ChannelOrder(tfm_y)]
-    def __call__(self, im, y=None): return compose(im, y, self.tfms)
+        self.apply_transform = apply_transform
+        self.tfm_y = tfm_y
+
+    def determ(self):
+        l = [t.determ() for t in self.tfms]
+        def composed_transform(x, tfmtype, is_y):
+            for t in l: x = t(x, tfmtype, is_y)
+            return x
+        return composed_transform
+
+    def __call__(self, im, y=None):
+        t = self.determ()
+        if self.apply_transform is None: return self.default_apply_transform(t, im, y)
+        return self.apply_transform(t, im, y)
+
+    def default_apply_transform(self, t, x, y): # for compatibility
+        if y is None: return t(x, TfmType.PIXEL, is_y=False)
+        return t(x, TfmType.PIXEL, is_y=False), t(y, self.tfm_y, is_y=True)
+
     def __repr__(self): return str(self.tfms)
 
 
 def image_gen(normalizer, denorm, sz, tfms=None, max_zoom=None, pad=0, crop_type=None,
-              tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT):
+              tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT, apply_transform=None):
     """
     Generate a standard set of transformations
 
@@ -591,7 +655,7 @@ def image_gen(normalizer, denorm, sz, tfms=None, max_zoom=None, pad=0, crop_type
              else Scale(sz, tfm_y, sz_y=sz_y)]
     if pad: scale.append(AddPadding(pad, mode=pad_mode))
     #if (max_zoom is not None or pad!=0) and crop_type is None: crop_type = CropType.RANDOM
-    return Transforms(sz, scale + tfms, normalizer, denorm, crop_type, tfm_y=tfm_y, sz_y=sz_y)
+    return Transforms(sz, scale + tfms, normalizer, denorm, crop_type, tfm_y=tfm_y, sz_y=sz_y, apply_transform=apply_transform)
 
 def noop(x):
     """dummy function for do-nothing.
@@ -608,21 +672,21 @@ inception_stats = A([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 inception_models = (inception_4, inceptionresnet_2)
 
 def tfms_from_stats(stats, sz, aug_tfms=None, max_zoom=None, pad=0, crop_type=CropType.RANDOM,
-                    tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT):
+                    tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT, apply_transform=None):
     """ Given the statistics of the training image sets, returns separate training and validation transform functions
     """
     if aug_tfms is None: aug_tfms=[]
     tfm_norm = Normalize(*stats, tfm_y=tfm_y)
     tfm_denorm = Denormalize(*stats)
     val_crop = CropType.CENTER if crop_type==CropType.RANDOM else crop_type
-    val_tfm = image_gen(tfm_norm, tfm_denorm, sz, pad=pad, crop_type=val_crop, tfm_y=tfm_y, sz_y=sz_y)
+    val_tfm = image_gen(tfm_norm, tfm_denorm, sz, pad=pad, crop_type=val_crop, tfm_y=tfm_y, sz_y=sz_y, apply_transform=apply_transform)
     trn_tfm = image_gen(tfm_norm, tfm_denorm, sz, pad=pad, crop_type=crop_type, tfm_y=tfm_y, sz_y=sz_y,
-                        tfms=aug_tfms, max_zoom=max_zoom, pad_mode=pad_mode)
+                        tfms=aug_tfms, max_zoom=max_zoom, pad_mode=pad_mode, apply_transform=apply_transform)
     return trn_tfm, val_tfm
 
 
 def tfms_from_model(f_model, sz, aug_tfms=None, max_zoom=None, pad=0, crop_type=CropType.RANDOM,
-                    tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT):
+                    tfm_y=None, sz_y=None, pad_mode=cv2.BORDER_REFLECT, apply_transform=None):
     """ Returns separate transformers of images for training and validation.
     Transformers are constructed according to the image statistics given b y the model. (See tfms_from_stats)
 
@@ -631,5 +695,5 @@ def tfms_from_model(f_model, sz, aug_tfms=None, max_zoom=None, pad=0, crop_type=
     """
     stats = inception_stats if f_model in inception_models else imagenet_stats
     return tfms_from_stats(stats, sz, aug_tfms, max_zoom=max_zoom, pad=pad, crop_type=crop_type,
-                       tfm_y=tfm_y, sz_y=sz_y, pad_mode=pad_mode)
+                       tfm_y=tfm_y, sz_y=sz_y, pad_mode=pad_mode, apply_transform=apply_transform)
 
