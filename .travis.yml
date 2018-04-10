@@ -25,7 +25,7 @@ install:
   - pip install -U pytest
   # for some reason  the pip section is not supported by conda env update for the time being i've paste it here:
   - pip install opencv-python
-  - pip insatll graphviz
+  - pip install graphviz
   - pip install torchvision>=0.1.9
   - pip install opencv-python
   - pip install isoweek
