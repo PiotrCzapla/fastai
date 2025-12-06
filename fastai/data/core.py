@@ -303,7 +303,7 @@ class FilteredBase:
     @property
     def n_subsets(self): return len(self.splits)
     def _new(self, items, **kwargs): return super()._new(items, splits=self.splits, **kwargs)
-    def subset(self): raise NotImplemented
+    def subset(self,i): raise NotImplemented
 
     def dataloaders(self, 
         bs:int=64, # Batch size
