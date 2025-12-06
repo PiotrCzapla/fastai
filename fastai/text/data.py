@@ -36,8 +36,8 @@ LMTensorText.__doc__ = "Semantic type for a tensor representing text in language
 # %% ../../nbs/31_text.data.ipynb 14
 class Numericalize(Transform):
     "Reversible transform of tokenized texts to numericalized ids"
-    def __init__(self, vocab=None, min_freq=3, max_vocab=60000, special_toks=None):
-        store_attr('vocab,min_freq,max_vocab,special_toks')
+    def __init__(self, vocab=None, min_freq=3, max_vocab=60000, special_toks=None, tok=None):
+        store_attr('vocab,min_freq,max_vocab,special_toks,tok')
         self.o2i = None if vocab is None else defaultdict(int, {v:k for k,v in enumerate(vocab)})
 
     def setups(self, dsets):
@@ -49,13 +49,13 @@ class Numericalize(Transform):
             self.vocab = make_vocab(count, min_freq=self.min_freq, max_vocab=self.max_vocab, special_toks=self.special_toks)
             self.o2i = defaultdict(int, {v:k for k,v in enumerate(self.vocab) if v != 'xxfake'})
 
-    def encodes(self, o): return TensorText(tensor([self.o2i  [o_] for o_ in o]))
+    def encodes(self, o): return TensorText(tensor([self.o2i  [o_] for o_ in o]) if self.tok is None or not self.tok.output_ids else o)
     def decodes(self, o): return L(self.vocab[o_] for o_ in o)
 
-# %% ../../nbs/31_text.data.ipynb 22
+# %% ../../nbs/31_text.data.ipynb 24
 def _maybe_first(o): return o[0] if isinstance(o, tuple) else o
 
-# %% ../../nbs/31_text.data.ipynb 23
+# %% ../../nbs/31_text.data.ipynb 25
 def _get_tokenizer(ds):
     tok = getattr(ds, 'tokenizer', None)
     if isinstance(tok, Tokenizer): return tok
@@ -63,19 +63,19 @@ def _get_tokenizer(ds):
         for t in tok:
             if isinstance(t, Tokenizer): return t
 
-# %% ../../nbs/31_text.data.ipynb 24
+# %% ../../nbs/31_text.data.ipynb 26
 def _get_lengths(ds):
     tok = _get_tokenizer(ds)
     if tok is None: return
     return tok.get_lengths(ds.items)
 
-# %% ../../nbs/31_text.data.ipynb 25
-#TODO: add backward
+# %% ../../nbs/31_text.data.ipynb 27
 @delegates()
 class LMDataLoader(TfmdDL):
     "A `DataLoader` suitable for language modeling"
-    def __init__(self, dataset, lens=None, cache=2, bs=64, seq_len=72, num_workers=0, **kwargs):
+    def __init__(self, dataset, lens=None, cache=2, bs=64, seq_len=72, num_workers=0, backwards=False, **kwargs):
         self.items = ReindexCollection(dataset, cache=cache, tfm=_maybe_first)
+        self.backwards = backwards
         self.seq_len = seq_len
         if lens is None: lens = _get_lengths(dataset)
         if lens is None: lens = [len(o) for o in self.items]
@@ -89,7 +89,9 @@ class LMDataLoader(TfmdDL):
         super().__init__(dataset=dataset, bs=bs, num_workers=num_workers, **kwargs)
         self.n = self.n_batches*bs
 
-    def make_chunks(self): self.chunks = Chunks(self.items, self.lens)
+    def make_chunks(self): 
+        self.chunks = (ReversedChunks if self.backwards else Chunks)(self.items, self.lens)
+        
     def shuffle_fn(self,idxs):
         self.items.shuffle()
         self.make_chunks()
@@ -104,12 +106,13 @@ class LMDataLoader(TfmdDL):
         return LMTensorText(txt[:-1]),txt[1:]
 
     @delegates(TfmdDL.new)
-    def new(self, dataset=None, seq_len=None, **kwargs):
-        lens = self.lens.coll if dataset is None else None
-        seq_len = self.seq_len if seq_len is None else seq_len
-        return super().new(dataset=dataset, lens=lens, seq_len=seq_len, **kwargs)
+    def new(self, dataset=None, seq_len=None, backwards=None, **kwargs):
+        kwargs['lens'] = self.lens.coll if dataset is None else None
+        kwargs['seq_len'] = ifnone(seq_len, self.seq_len)
+        kwargs['backwards'] = ifnone(backwards, self.backwards)
+        return super().new(dataset=dataset, **kwargs)
 
-# %% ../../nbs/31_text.data.ipynb 35
+# %% ../../nbs/31_text.data.ipynb 37
 @dispatch
 def show_batch(x: TensorText, y, samples, ctxs=None, max_n=10, trunc_at=150, **kwargs):
     if ctxs is None: ctxs = get_empty_df(min(len(samples), max_n))
@@ -118,13 +121,13 @@ def show_batch(x: TensorText, y, samples, ctxs=None, max_n=10, trunc_at=150, **k
     display_df(pd.DataFrame(ctxs))
     return ctxs
 
-# %% ../../nbs/31_text.data.ipynb 36
+# %% ../../nbs/31_text.data.ipynb 38
 @dispatch
 def show_batch(x: LMTensorText, y, samples, ctxs=None, max_n=10, trunc_at=150, **kwargs):
     samples = L((s[0].truncate(trunc_at), s[1].truncate(trunc_at)) for s in samples)
     return get_show_batch_func(TensorText)(x, None, samples, ctxs=ctxs, max_n=max_n, trunc_at=None, **kwargs)
 
-# %% ../../nbs/31_text.data.ipynb 39
+# %% ../../nbs/31_text.data.ipynb 41
 class Pad_Input(ItemTransform):
     def encodes(self,samples, pad_idx=1, pad_fields=0, pad_first=False, backwards=False):
         "Function that collect `samples` and adds padding"
@@ -146,16 +149,17 @@ class Pad_Input(ItemTransform):
         return o[o != pad_idx]
 pad_input=Pad_Input()
 
-# %% ../../nbs/31_text.data.ipynb 44
-def pad_chunk(x,pad_idx=1, pad_first=True, seq_len=72, pad_len=10):
+# %% ../../nbs/31_text.data.ipynb 45
+def pad_chunk(x, pad_idx=1, bos_idx=None, pad_first=True, seq_len=72, pad_len=10):
     "Pad `x` by adding padding by chunks of size `seq_len`"
+    if bos_idx is None: pad_len = math.ceil(pad_len/seq_len)*seq_len if pad_len > seq_len else pad_len
     l = pad_len - x.shape[0]
     pad_chunk = x.new_zeros((l//seq_len) * seq_len) + pad_idx
-    pad_res   = x.new_zeros(l % seq_len) + pad_idx
-    x1 = torch.cat([pad_chunk, x, pad_res]) if pad_first else torch.cat([x, pad_chunk, pad_res])
-    return retain_type(x1, x)
+    pad_res   = x.new_zeros(l % seq_len) + ifnone(bos_idx, pad_idx)
+    t = [pad_chunk, x, pad_res] if bos_idx is None else [pad_chunk, pad_res, x]
+    return retain_type(torch.cat(t if pad_first else t[::-1]), x)
 
-# %% ../../nbs/31_text.data.ipynb 47
+# %% ../../nbs/31_text.data.ipynb 49
 @delegates(pad_chunk)
 def pad_input_chunk(samples, n_inp=1,**kwargs):
     "Pad `samples` by adding padding by chunks of size `seq_len`"
@@ -163,11 +167,11 @@ def pad_input_chunk(samples, n_inp=1,**kwargs):
     padeds = [[pad_chunk(s[n],pad_len=max_len,**kwargs) for n in range(n_inp) ] for s in samples]
     return [(*p, *s[n_inp:]) for p,s in zip(padeds,samples)]
 
-# %% ../../nbs/31_text.data.ipynb 52
+# %% ../../nbs/31_text.data.ipynb 55
 class Pad_Chunk(DisplayedTransform):
     "Pad `samples` by adding padding by chunks of size `seq_len`"
-    def __init__(self, pad_idx=1, pad_first=True, seq_len=72,decode=True,**kwargs):
-        store_attr('pad_idx, pad_first, seq_len,seq_len')
+    def __init__(self, pad_idx=1, bos_idx=None, pad_first=True, seq_len=72, decode=True, backwards=False, **kwargs):
+        store_attr('pad_idx, bos_idx, pad_first, seq_len, seq_len, backwards')
         super().__init__(**kwargs)
     def before_call(self, b):
         "Set `self.max_len` before encodes" 
@@ -176,11 +180,12 @@ class Pad_Chunk(DisplayedTransform):
         self.before_call(b)
         return super().__call__(tuple(b), **kwargs)
     def encodes(self, x:TensorText):
-        return pad_chunk(x,pad_idx=self.pad_idx, pad_first=self.pad_first, seq_len=self.seq_len, pad_len=self.max_len)
+        t = pad_chunk(x, pad_idx=self.pad_idx, bos_idx=self.bos_idx, pad_first=self.pad_first, seq_len=self.seq_len, pad_len=self.max_len)
+        return t[::-1] if self.backwards else t
     def decodes(self, o:TensorText):
         return o[o != self.pad_idx] if self.decode else o
 
-# %% ../../nbs/31_text.data.ipynb 56
+# %% ../../nbs/31_text.data.ipynb 61
 def _default_sort(x): return len(x[0])
 
 @delegates(TfmdDL)
@@ -219,16 +224,16 @@ class SortedDL(TfmdDL):
         else: res = self.res if dataset is None else None
         return super().new(dataset=dataset, res=res, **kwargs)
 
-# %% ../../nbs/31_text.data.ipynb 62
+# %% ../../nbs/31_text.data.ipynb 67
 class TextBlock(TransformBlock):
     "A `TransformBlock` for texts"
     @delegates(Numericalize.__init__)
     def __init__(self, tok_tfm, vocab=None, is_lm=False, seq_len=72, backwards=False, **kwargs):
         type_tfms = [tok_tfm, Numericalize(vocab, **kwargs)]
-        if backwards: type_tfms += [reverse_text]
+        #if backwards: type_tfms += [reverse_text] backwards is handled below
         return super().__init__(type_tfms=type_tfms,
                                 dl_type=LMDataLoader if is_lm else SortedDL,
-                                dls_kwargs={'seq_len': seq_len} if is_lm else {'before_batch': Pad_Chunk(seq_len=seq_len)})
+                                dls_kwargs={'seq_len': seq_len, 'backwards': backwards} if is_lm else {'before_batch': Pad_Chunk(seq_len=seq_len, backwards=backwards)})
 
     @classmethod
     @delegates(Tokenizer.from_df, keep=True)
@@ -244,7 +249,7 @@ class TextBlock(TransformBlock):
         return cls(Tokenizer.from_folder(path, **kwargs), vocab=vocab, is_lm=is_lm, seq_len=seq_len,
                    backwards=backwards, min_freq=min_freq, max_vocab=max_vocab)
 
-# %% ../../nbs/31_text.data.ipynb 71
+# %% ../../nbs/31_text.data.ipynb 76
 class TextDataLoaders(DataLoaders):
     "Basic wrapper around several `DataLoader`s with factory methods for NLP problems"
     @classmethod
