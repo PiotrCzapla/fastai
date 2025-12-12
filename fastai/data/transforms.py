@@ -369,7 +369,10 @@ class Normalize(DisplayedTransform):
     def __init__(self, mean=None, std=None, axes=(0,2,3)): store_attr()
 
     @classmethod
-    def from_stats(cls, mean, std, dim=1, ndim=4, cuda=True): return cls(*broadcast_vec(dim, ndim, mean, std, cuda=cuda))
+    def from_stats(cls, mean, std, dim=1, ndim=4, cuda=None): 
+        if cuda is not None:
+            warnings.warn("`cuda` is deprecated and will be removed. Device is now handled automatically by DataLoader.", DeprecationWarning)
+        return cls(*broadcast_vec(dim, ndim, mean, std, cuda=False))
 
     def setups(self, dl:DataLoader):
         if self.mean is None or self.std is None:

@@ -246,7 +246,10 @@ class DataLoaders(GetAttr):
         if not is_listy(loaders): loaders = listify(loaders)
         for loader in loaders:
             self._add_tfms(tfms,event,loader)      
-
+        if self.device is not None:
+            # we move newly added tfms to device
+            self.device = self.device 
+                        
     def cuda(self): return self.to(device=default_device())
     def cpu(self):  return self.to(device=torch.device('cpu'))
 
