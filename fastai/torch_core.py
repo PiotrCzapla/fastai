@@ -538,7 +538,8 @@ class ReversedChunks(Chunks):
     def getslice(self, i):
         t = len(self)
         i = slice(t - ifnone(i.stop, t), t - ifnone(i.start, 0))
-        return super().getslice(i)[::-1] 
+        r = super().getslice(i)
+        return r.flip(0) if hasattr(r, 'flip') else r[::-1]
     def doc_idx(self, i): return super().doc_idx(-(i+1))
 
 # %% ../nbs/00_torch_core.ipynb 142

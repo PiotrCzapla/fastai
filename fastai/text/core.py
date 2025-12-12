@@ -12,7 +12,8 @@ __all__ = ['UNK', 'PAD', 'BOS', 'EOS', 'FLD', 'TK_REP', 'TK_WREP', 'TK_UP', 'TK_
            'fn_lengths_pkl', 'eu_langs', 'SubwordTokenizer', 'spec_add_spaces', 'rm_useless_spaces', 'replace_rep',
            'replace_wrep', 'fix_html', 'replace_all_caps', 'replace_maj', 'lowercase', 'replace_space', 'BaseTokenizer',
            'SpacyTokenizer', 'TokenizeWithRules', 'tokenize1', 'parallel_tokenize', 'tokenize_folder', 'tokenize_files',
-           'tokenize_texts', 'tokenize_df', 'tokenize_csv', 'load_tokenized_csv', 'Tokenizer', 'SentencePieceTokenizer']
+           'tokenize_texts', 'tokenize_df', 'tokenize_csv', 'load_tokenized_csv', 'Tokenizer', 'SentencePieceTokenizer',
+           'HFTokenizer']
 
 # %% ../../nbs/30_text.core.ipynb 5
 import html
@@ -20,6 +21,7 @@ import html
 # %% ../../nbs/30_text.core.ipynb 8
 #special tokens
 UNK, PAD, BOS, EOS, FLD, TK_REP, TK_WREP, TK_UP, TK_MAJ = "xxunk xxpad xxbos xxeos xxfld xxrep xxwrep xxup xxmaj".split()
+
 
 # %% ../../nbs/30_text.core.ipynb 9
 _all_ = ["UNK", "PAD", "BOS", "EOS", "FLD", "TK_REP", "TK_WREP", "TK_UP", "TK_MAJ"]
@@ -101,6 +103,7 @@ def replace_space(t):
 
 # %% ../../nbs/30_text.core.ipynb 34
 defaults.text_spec_tok = [UNK, PAD, BOS, EOS, FLD, TK_REP, TK_WREP, TK_UP, TK_MAJ]
+defaults.pad_idx = 1
 defaults.text_proc_rules = [fix_html, replace_rep, replace_wrep, spec_add_spaces, rm_useless_spaces,
                             replace_all_caps, replace_maj, lowercase]
 defaults.text_postproc_rules = [replace_space]
@@ -108,7 +111,7 @@ defaults.text_postproc_rules = [replace_space]
 # %% ../../nbs/30_text.core.ipynb 37
 class BaseTokenizer():
     "Basic tokenizer that just splits on spaces"
-    def __init__(self, split_char=' ', **kwargs): self.split_char,self.output_id=split_char,False
+    def __init__(self, split_char=' ', **kwargs): self.split_char,self.output_ids=split_char,False
     def __call__(self, items): return (t.split(self.split_char) for t in items)
 
 # %% ../../nbs/30_text.core.ipynb 39
@@ -163,7 +166,8 @@ def _tokenize_files(func, files, path, output_dir=None, output_names=None, n_wor
                    encoding='utf8', skip_if_exists=False):
     "Tokenize text `files` in parallel using `n_workers`"
     if tok is None: tok = WordTokenizer()
-    output_dir = Path(ifnone(output_dir, path.parent/f'{path.name}_tok'))
+    suffix = '_tok_ids' if getattr(tok, 'output_ids', False) else '_tok'
+    output_dir = Path(ifnone(output_dir, path.parent/f'{path.name}{suffix}'))
     if skip_if_exists and output_dir.exists(): return output_dir
     output_dir.mkdir(exist_ok=True)
     if output_names is None: output_names = L(output_dir/f.relative_to(path) for f in files)
@@ -331,7 +335,7 @@ eu_langs = ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "ga", "h
             "it","lt","lv","mt","nl","pl","pt","ro","sk","sl","sv"] # all European langs
 
 # %% ../../nbs/30_text.core.ipynb 76
-class SentencePieceTokenizer():#TODO: pass the special tokens symbol to sp
+class SentencePieceTokenizer(): #TODO: pass the special tokens symbol to sp
     "SentencePiece tokenizer for `lang`"
     def __init__(self, lang='en', special_toks=None, sp_model=None, vocab_sz=None, max_vocab_sz=30000,
                  model_type='unigram', char_coverage=None, cache_dir='tmp', output_ids=True):
@@ -350,11 +354,10 @@ class SentencePieceTokenizer():#TODO: pass the special tokens symbol to sp
         self.sp_model = sp_model
         if sp_model is None: 
             self.tok = None
-            self.vocab_sz = None
         else: 
             self.tok = SentencePieceProcessor()
             self.tok.Load(str(sp_model))
-            self.vocab_sz = self.tok.vocab_size()
+            self.vocab_sz = self.tok.vocab_size() 
         return sp_model
 
     def _get_vocab_sz(self, raw_text_path):
@@ -365,7 +368,7 @@ class SentencePieceTokenizer():#TODO: pass the special tokens symbol to sp
                 if len(cnt)//4 > self.max_vocab_sz: return self.max_vocab_sz
         res = len(cnt)//4
         while res%8 != 0: res+=1
-        return max(res,29)
+        return max(res,36)
 
     def train(self, raw_text_path, unlink=True):
         "Train a sentencepiece tokenizer on `texts` and save it in `path/tmp_dir`"
@@ -391,15 +394,18 @@ class SentencePieceTokenizer():#TODO: pass the special tokens symbol to sp
         return {'sp_model': self.sp_model}
 
     @property
-    def sp_vocab(self):
-        return self.decode_to_pieces(range(self.vocab_sz)) if self.tok else L()
-
+    def vocab(self):
+        return list(self.decode_to_pieces(range(self.vocab_sz)) if self.tok else L())
+    
     def __call__(self, items):
         if self.tok is None: self.setup(items)
-        for t in items: yield tensor(self.tok.EncodeAsIds(t)).numpy() if self.output_ids else self.tok.EncodeAsPieces(t)
-
+        for t in items: yield tensor(self.tok.EncodeAsIds(t), dtype=torch.long).numpy() if self.output_ids else self.tok.EncodeAsPieces(t)
+    
+    def decode(self, ids):
+        return self.decode_to_pieces(ids)
+    # helper methods
     def encode_pieces(self, pices):
-        return tensor([self.tok.PieceToId(i) for i in pices])
+        return tensor([self.tok.PieceToId(i) for i in pices], dtype=torch.long)
 
     def decode_to_text(self, ids) -> str:
         "Decode token ids back to text"
@@ -409,6 +415,28 @@ class SentencePieceTokenizer():#TODO: pass the special tokens symbol to sp
         "Convert a single id to its piece/token"
         return L(self.tok.IdToPiece(int(id_)) for id_ in ids)
 
-
 # %% ../../nbs/30_text.core.ipynb 77
+SentencePieceTokenizer.sp_vocab = SentencePieceTokenizer.vocab
 SubwordTokenizer = SentencePieceTokenizer
+
+# %% ../../nbs/30_text.core.ipynb 87
+class HFTokenizer:
+    "HuggingFace tokenizers wrapper mimicking SentencePieceTokenizer API"
+    def __init__(self, pretrained, output_ids=True, special_toks=None):
+        import tokenizers as hftok
+        self.tok = hftok.Tokenizer.from_pretrained(pretrained)
+        self.output_ids = output_ids
+        self.vocab_sz = self.tok.get_vocab_size()
+        if special_toks is None: special_toks = defaults.text_spec_tok
+        self.tok.add_special_tokens([f' {s}' if s != BOS else s for s in special_toks])
+        self.vocab = self.decode_to_pieces(range(self.vocab_sz))
+    def __call__(self, items):
+        for t in items: yield np.array(self.tok.encode(t).ids, dtype=np.int64) if self.output_ids else self.tok.encode(t).tokens
+    
+    def decode(self, ids): return self.decode_to_pieces(ids)
+    
+    def decode_to_text(self, ids): return self.tok.decode(list(ids))
+    
+    def decode_to_pieces(self, ids): return [self.tok.id_to_token(int(i)) for i in ids]
+    
+    def encode_pieces(self, pieces): return torch.tensor([self.tok.token_to_id(p) for p in pieces], dtype=torch.long)

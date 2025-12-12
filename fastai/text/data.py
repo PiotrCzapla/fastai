@@ -39,9 +39,18 @@ class Numericalize(Transform):
     def __init__(self, vocab=None, min_freq=3, max_vocab=60000, special_toks=None, tok=None):
         store_attr('vocab,min_freq,max_vocab,special_toks,tok')
         self.o2i = None if vocab is None else defaultdict(int, {v:k for k,v in enumerate(vocab)})
+        if  tok and tok.output_ids:
+            if vocab or min_freq != 3 or max_vocab != 60000  or special_toks: 
+                print("Numericalize is a noop operation when passing tok that outputs ids, all other arguments are ignored")
+            self.vocab = None
+            self.o2i = None
 
     def setups(self, dsets):
         if dsets is None: return
+        if self.tok and self.tok.output_ids:
+            self.vocab = self.tok.vocab
+            self.o2i = defaultdict(int, {v:k for k,v in enumerate(self.vocab)})
+            return
         if self.vocab is None:
             count = dsets.counter if getattr(dsets, 'counter', None) is not None else Counter(p for o in dsets for p in o)
             if self.special_toks is None and hasattr(dsets, 'special_toks'):
@@ -49,8 +58,8 @@ class Numericalize(Transform):
             self.vocab = make_vocab(count, min_freq=self.min_freq, max_vocab=self.max_vocab, special_toks=self.special_toks)
             self.o2i = defaultdict(int, {v:k for k,v in enumerate(self.vocab) if v != 'xxfake'})
 
-    def encodes(self, o): return TensorText(tensor([self.o2i  [o_] for o_ in o]) if self.tok is None or not self.tok.output_ids else o)
-    def decodes(self, o): return L(self.vocab[o_] for o_ in o)
+    def encodes(self, o): return TensorText(tensor([self.o2i  [o_] for o_ in o] if not getattr(self.tok, 'output_ids', False) else o, dtype=torch.long))
+    def decodes(self, o): return L(self.vocab[o_] for o_ in o) if not hasattr(self.tok, 'decode') else self.tok.decode(o)
 
 # %% ../../nbs/31_text.data.ipynb 24
 def _maybe_first(o): return o[0] if isinstance(o, tuple) else o
@@ -127,7 +136,7 @@ def show_batch(x: LMTensorText, y, samples, ctxs=None, max_n=10, trunc_at=150, *
     samples = L((s[0].truncate(trunc_at), s[1].truncate(trunc_at)) for s in samples)
     return get_show_batch_func(TensorText)(x, None, samples, ctxs=ctxs, max_n=max_n, trunc_at=None, **kwargs)
 
-# %% ../../nbs/31_text.data.ipynb 41
+# %% ../../nbs/31_text.data.ipynb 43
 class Pad_Input(ItemTransform):
     def encodes(self,samples, pad_idx=1, pad_fields=0, pad_first=False, backwards=False):
         "Function that collect `samples` and adds padding"
@@ -149,17 +158,18 @@ class Pad_Input(ItemTransform):
         return o[o != pad_idx]
 pad_input=Pad_Input()
 
-# %% ../../nbs/31_text.data.ipynb 45
-def pad_chunk(x, pad_idx=1, bos_idx=None, pad_first=True, seq_len=72, pad_len=10):
+# %% ../../nbs/31_text.data.ipynb 47
+def pad_chunk(x, pad_idx=None, pad_first=True, seq_len=72, pad_len=10):
     "Pad `x` by adding padding by chunks of size `seq_len`"
-    if bos_idx is None: pad_len = math.ceil(pad_len/seq_len)*seq_len if pad_len > seq_len else pad_len
+    if pad_idx is None: pad_idx = defaults.pad_idx
+    pad_len = math.ceil(pad_len/seq_len)*seq_len if pad_len > seq_len else pad_len
     l = pad_len - x.shape[0]
     pad_chunk = x.new_zeros((l//seq_len) * seq_len) + pad_idx
-    pad_res   = x.new_zeros(l % seq_len) + ifnone(bos_idx, pad_idx)
-    t = [pad_chunk, x, pad_res] if bos_idx is None else [pad_chunk, pad_res, x]
+    pad_res   = x.new_zeros(l % seq_len) + pad_idx
+    t = [pad_chunk, x[0:1], x[1:], pad_res]
     return retain_type(torch.cat(t if pad_first else t[::-1]), x)
 
-# %% ../../nbs/31_text.data.ipynb 49
+# %% ../../nbs/31_text.data.ipynb 50
 @delegates(pad_chunk)
 def pad_input_chunk(samples, n_inp=1,**kwargs):
     "Pad `samples` by adding padding by chunks of size `seq_len`"
@@ -167,11 +177,16 @@ def pad_input_chunk(samples, n_inp=1,**kwargs):
     padeds = [[pad_chunk(s[n],pad_len=max_len,**kwargs) for n in range(n_inp) ] for s in samples]
     return [(*p, *s[n_inp:]) for p,s in zip(padeds,samples)]
 
-# %% ../../nbs/31_text.data.ipynb 55
+# %% ../../nbs/31_text.data.ipynb 56
 class Pad_Chunk(DisplayedTransform):
     "Pad `samples` by adding padding by chunks of size `seq_len`"
-    def __init__(self, pad_idx=1, bos_idx=None, pad_first=True, seq_len=72, decode=True, backwards=False, **kwargs):
-        store_attr('pad_idx, bos_idx, pad_first, seq_len, seq_len, backwards')
+    def __init__(self, pad_idx=None, pad_first=None, seq_len=72, decode=True, backwards=False, **kwargs):
+        store_attr('pad_idx, seq_len, pad_first, seq_len, backwards')
+        if pad_idx is None: self.pad_idx = defaults.pad_idx
+        if pad_first is not None:
+            print("pad_first is deprecated, use backwards=True instead, it flips the example too")
+        else:
+            self.pad_first = not backwards
         super().__init__(**kwargs)
     def before_call(self, b):
         "Set `self.max_len` before encodes" 
@@ -180,12 +195,12 @@ class Pad_Chunk(DisplayedTransform):
         self.before_call(b)
         return super().__call__(tuple(b), **kwargs)
     def encodes(self, x:TensorText):
-        t = pad_chunk(x, pad_idx=self.pad_idx, bos_idx=self.bos_idx, pad_first=self.pad_first, seq_len=self.seq_len, pad_len=self.max_len)
-        return t[::-1] if self.backwards else t
+        t = pad_chunk(x, pad_idx=self.pad_idx, pad_first=self.pad_first, seq_len=self.seq_len, pad_len=self.max_len)
+        return t.flip(0) if self.backwards else t
     def decodes(self, o:TensorText):
         return o[o != self.pad_idx] if self.decode else o
 
-# %% ../../nbs/31_text.data.ipynb 61
+# %% ../../nbs/31_text.data.ipynb 62
 def _default_sort(x): return len(x[0])
 
 @delegates(TfmdDL)
@@ -224,7 +239,7 @@ class SortedDL(TfmdDL):
         else: res = self.res if dataset is None else None
         return super().new(dataset=dataset, res=res, **kwargs)
 
-# %% ../../nbs/31_text.data.ipynb 67
+# %% ../../nbs/31_text.data.ipynb 68
 class TextBlock(TransformBlock):
     "A `TransformBlock` for texts"
     @delegates(Numericalize.__init__)
@@ -249,7 +264,7 @@ class TextBlock(TransformBlock):
         return cls(Tokenizer.from_folder(path, **kwargs), vocab=vocab, is_lm=is_lm, seq_len=seq_len,
                    backwards=backwards, min_freq=min_freq, max_vocab=max_vocab)
 
-# %% ../../nbs/31_text.data.ipynb 76
+# %% ../../nbs/31_text.data.ipynb 77
 class TextDataLoaders(DataLoaders):
     "Basic wrapper around several `DataLoader`s with factory methods for NLP problems"
     @classmethod

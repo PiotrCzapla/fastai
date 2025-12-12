@@ -82,10 +82,11 @@ class SentenceEncoder(Module):
     def __init__(self, 
         bptt:int, # Backpropagation through time
         module:nn.Module, # A module that can process up to [`bs`, `bptt`] tokens
-        pad_idx:int=1, # Padding token id 
-        max_len:int=None # Maximal output length
+        pad_idx:int|None=None, # Padding token id 
+        max_len:int|None=None # Maximal output length
     ): 
         store_attr('bptt,module,pad_idx,max_len')
+        if pad_idx is None: self.pad_idx = defaults.pad_idx
     
     def reset(self): getcallable(self.module, 'reset')()
 
@@ -152,7 +153,7 @@ def get_text_classifier(
     drop_mult:float=1., # Multiplicative factor to scale all dropout probabilities in `config`
     lin_ftrs:list=None, # List of hidden sizes for classifier head as `int`s
     ps:list=None, # List of dropout probabilities for classifier head as `float`s
-    pad_idx:int=1, # Padding token id
+    pad_idx:int|None=None, # Padding token id
     max_len:int=72*20, # Maximal output length for `SentenceEncoder`
     y_range:tuple=None # Tuple of (low, high) output value bounds
 ):
