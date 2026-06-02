@@ -420,7 +420,7 @@ class SentencePieceTokenizer(): #TODO: pass the special tokens symbol to sp
 SentencePieceTokenizer.sp_vocab = SentencePieceTokenizer.vocab
 SubwordTokenizer = SentencePieceTokenizer
 
-# %% ../../nbs/30_text.core.ipynb #3e729d00
+# %% ../../nbs/30_text.core.ipynb #e234e4ed
 class HFTokenizer:
     "HuggingFace tokenizers wrapper mimicking SentencePieceTokenizer API"
     def __init__(self, pretrained, output_ids=True, special_toks=None):

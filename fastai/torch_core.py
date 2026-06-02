@@ -530,7 +530,7 @@ class Chunks:
 
     def __len__(self): return self.totlen
 
-# %% ../nbs/00_torch_core.ipynb #e82135c4
+# %% ../nbs/00_torch_core.ipynb #07849b81
 class ReversedChunks(Chunks):
     "Slice and int indexing into a list of lists but in reverse"
     def __init__(self, chunks, lens=None):
